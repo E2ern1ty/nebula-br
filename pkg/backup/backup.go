@@ -6,6 +6,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
@@ -89,43 +90,72 @@ func (b *Backup) uploadMeta(host *nebula.HostAddr, targetUri string, localDir st
 }
 
 func (b *Backup) uploadStorage(hostDirs map[string]map[string][]string, targetUri string) error {
+	const maxConcurrency = 5
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(hostDirs))
+	semaphore := make(chan struct{}, maxConcurrency)
+
 	for addrStr, spaceDirs := range hostDirs {
-		// get storage node's agent
-		addr, err := utils.ParseAddr(addrStr)
-		if err != nil {
-			return err
-		}
-		agentAddr, err := b.hosts.GetAgentFor(addr)
-		if err != nil {
-			return err
-		}
-		agent, err := clients.NewAgent(b.ctx, agentAddr)
-		if err != nil {
-			return err
-		}
+		wg.Add(1)
+		go func(addrStr string, spaceDirs map[string][]string) {
+			defer wg.Done()
 
-		logger := log.WithField("host", addrStr)
-		// upload every space in this node
-		for idStr, dirs := range spaceDirs {
-			for i, source := range dirs {
-				// {backupRoot}/{backupName}/data/{addr}/data{0..n}/{spaceId}
-				target, _ := utils.UriJoin(targetUri, addrStr, fmt.Sprintf("data%d", i), idStr)
-				backend, err := b.sto.GetDir(b.ctx, target)
-				if err != nil {
-					return fmt.Errorf("get storage backend for %s failed: %w", target, err)
-				}
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-				req := &pb.UploadFileRequest{
-					SourcePath:    source,
-					TargetBackend: backend,
-					Recursively:   true,
-				}
-				_, err = agent.UploadFile(req)
-				if err != nil {
-					return fmt.Errorf("upload %s to %s failed:%w", source, target, err)
-				}
-				logger.WithField("src", source).WithField("target", target).Info("Upload storage checkpoint successfully.")
+			if err := b.uploadStorageForHost(addrStr, spaceDirs, targetUri); err != nil {
+				errCh <- err
 			}
+		}(addrStr, spaceDirs)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		return err
+	}
+
+	return nil
+}
+
+func (b *Backup) uploadStorageForHost(addrStr string, spaceDirs map[string][]string, targetUri string) error {
+	// get storage node's agent
+	addr, err := utils.ParseAddr(addrStr)
+	if err != nil {
+		return err
+	}
+	agentAddr, err := b.hosts.GetAgentFor(addr)
+	if err != nil {
+		return err
+	}
+	agent, err := clients.NewAgent(b.ctx, agentAddr)
+	if err != nil {
+		return err
+	}
+
+	logger := log.WithField("host", addrStr)
+	// upload every space in this node
+	for idStr, dirs := range spaceDirs {
+		for i, source := range dirs {
+			// {backupRoot}/{backupName}/data/{addr}/data{0..n}/{spaceId}
+			target, _ := utils.UriJoin(targetUri, addrStr, fmt.Sprintf("data%d", i), idStr)
+			backend, err := b.sto.GetDir(b.ctx, target)
+			if err != nil {
+				return fmt.Errorf("get storage backend for %s failed: %w", target, err)
+			}
+
+			req := &pb.UploadFileRequest{
+				SourcePath:    source,
+				TargetBackend: backend,
+				Recursively:   true,
+			}
+			_, err = agent.UploadFile(req)
+			if err != nil {
+				return fmt.Errorf("upload %s to %s failed:%w", source, target, err)
+			}
+			logger.WithField("src", source).WithField("target", target).Info("Upload storage checkpoint successfully.")
 		}
 	}
 
